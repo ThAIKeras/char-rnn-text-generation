@@ -40,6 +40,13 @@ def path_join(*paths, empty=False):
     return path
 
 
+def load_text(text_path):
+    with open(text_path) as f:
+        text = f.read()
+    logger.info("corpus length: %s.", len(text))    
+    return text
+
+
 ###
 # data processing
 ###
@@ -50,7 +57,7 @@ def create_dictionary():
     from printable ascii characters.
     """
     chars = sorted(ch for ch in string.printable if ch not in ("\x0b", "\x0c", "\r"))
-    char2id = dict((ch, i + 1) for i, ch in enumerate(chars))
+    char2id = dict((ch, i+1) for i, ch in enumerate(chars))
     char2id.update({"": 0})
     id2char = dict((char2id[ch], ch) for ch in char2id)
     vocab_size = len(char2id)
@@ -58,15 +65,44 @@ def create_dictionary():
 
 CHAR2ID, ID2CHAR, VOCAB_SIZE = create_dictionary()
 
+def rebuild_dictionary(text):
+    global CHAR2ID, ID2CHAR, VOCAB_SIZE
+    
+    d = dict((c, text.count(c)) for c in set(text))
+    char_count = [(c, d[c]) for c in sorted(d, key=d.get, reverse=True)][:99]
+    #print(char_count)
+    
+    #chars = sorted(list(set(text)))
+    chars = [cc[0] for cc in char_count]
+    logger.info(chars)
+    logger.info("total chars: %d", len(chars))
+    
+    CHAR2ID = dict((ch, i+1) for i, ch in enumerate(chars))
+    CHAR2ID.update({"": 0})
+    #print(CHAR2ID)
+    
+    ID2CHAR = dict((CHAR2ID[ch], ch) for ch in CHAR2ID)
+    VOCAB_SIZE = len(CHAR2ID)
+    
 
-def encode_text(text, char2id=CHAR2ID):
+def get_CHAR2ID():
+    return CHAR2ID
+
+def get_ID2CHAR():
+    return ID2CHAR
+
+def get_VOCAB_SIZE():
+    return VOCAB_SIZE
+        
+
+def encode_text(text, char2id):
     """
     encode text to array of integers with CHAR2ID
     """
     return np.fromiter((char2id.get(ch, 0) for ch in text), int)
 
 
-def decode_text(int_array, id2char=ID2CHAR):
+def decode_text(int_array, id2char):
     """
     decode array of integers to text with ID2CHAR
     """
@@ -96,12 +132,12 @@ def batch_generator(sequence, batch_size=64, seq_len=64, one_hot_features=False,
 
     x = np.reshape(sequence[: rounded_len], [batch_size, num_batches * seq_len])
     if one_hot_features:
-        x = one_hot_encode(x, VOCAB_SIZE)
+        x = one_hot_encode(x, get_VOCAB_SIZE())
     logger.info("x shape: %s.", x.shape)
 
     y = np.reshape(sequence[1: rounded_len + 1], [batch_size, num_batches * seq_len])
     if one_hot_labels:
-        y = one_hot_encode(y, VOCAB_SIZE)
+        y = one_hot_encode(y, get_VOCAB_SIZE())
     logger.info("y shape: %s.", y.shape)
 
     epoch = 0
@@ -130,14 +166,16 @@ def generate_seed(text, seq_lens=(2, 4, 8, 16, 32)):
     return seed
 
 
-def sample_from_probs(probs, top_n=10):
+def sample_from_probs(probs, top_n=None):
     """
     truncated weighted random choice.
     """
     # need 64 floating point precision
     probs = np.array(probs, dtype=np.float64)
     # set probabilities after top_n to 0
-    probs[np.argsort(probs)[:-top_n]] = 0
+    if top_n:
+        probs[np.argsort(probs)[:-top_n]] = 0    
+    #print(probs, sum(probs))    
     # renormalise probabilities
     probs /= np.sum(probs)
     sampled_index = np.random.choice(len(probs), p=probs)
@@ -148,7 +186,7 @@ def sample_from_probs(probs, top_n=10):
 # main
 ###
 
-def main(framework, train_main, generate_main):
+def main(framework, train_main, generate_main, test_main):
     arg_parser = ArgumentParser(
         description="{} character embeddings LSTM text generation model.".format(framework))
     subparsers = arg_parser.add_subparsers(title="subcommands")
@@ -182,30 +220,47 @@ def main(framework, train_main, generate_main):
                               help="number of epochs for training (default: %(default)s)")
     train_parser.add_argument("--log-path", default=os.path.join(os.path.dirname(__file__), "main.log"),
                               help="path of log file (default: %(default)s)")
+    train_parser.add_argument("--test-path", help="path of text file for testing")
     train_parser.set_defaults(main=train_main)
 
     # generate args
     generate_parser = subparsers.add_parser("generate", help="generate text from trained model")
     generate_parser.add_argument("--checkpoint-path", required=True,
                                  help="path to load model checkpoints (required)")
-    group = generate_parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--text-path", help="path of text file to generate seed")
-    group.add_argument("--seed", default=None, help="seed character sequence")
+    #group = generate_parser.add_mutually_exclusive_group(required=True)
+    #group.add_argument("--text-path", help="path of text file to generate seed and build dictionary")
+    #group.add_argument("--seed", default=None, help="seed character sequence")
+    generate_parser.add_argument("--text-path", required=True,
+                                 help="path of train file for building a dictionary (required)")
+    generate_parser.add_argument("--seed", default=None, help="seed character sequence")    
     generate_parser.add_argument("--length", type=int, default=1024,
                                  help="length of character sequence to generate (default: %(default)s)")
-    generate_parser.add_argument("--top-n", type=int, default=3,
+    generate_parser.add_argument("--top-n", type=int, default=None,
                                  help="number of top choices to sample (default: %(default)s)")
     generate_parser.add_argument("--log-path", default=os.path.join(os.path.dirname(__file__), "main.log"),
-                                 help="path of log file (default: %(default)s)")
+                                 help="path of log file (default: %(default)s)")     
     generate_parser.set_defaults(main=generate_main)
-
+    
+    # test args    
+    test_parser = subparsers.add_parser("test", help="test the model and calculate BPC")
+    test_parser.add_argument("--checkpoint-path", required=True,
+                              help="path to load model checkpoints (required)")
+    test_parser.add_argument("--text-path", required=True,
+                              help="path of train file for building a dictionary (required)")    
+    test_parser.add_argument("--test-path", required=True,
+                              help="path of text file for testing (required)")
+    test_parser.add_argument("--log-path", default=os.path.join(os.path.dirname(__file__), "main.log"),
+                              help="path of log file (default: %(default)s)")         
+    test_parser.set_defaults(main=test_main)
+    
     args = arg_parser.parse_args()
     get_logger("__main__", log_path=args.log_path, console=True)
     logger = get_logger(__name__, log_path=args.log_path, console=True)
     logger.debug("call: %s", " ".join(sys.argv))
-    logger.debug("ArgumentParser: %s", args)
+    logger.debug("ArgumentParser: %s", args)        
 
     try:
+        rebuild_dictionary(load_text(args.text_path))
         args.main(args)
     except Exception as e:
         logger.exception(e)

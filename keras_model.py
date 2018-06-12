@@ -1,6 +1,7 @@
 import os
 import time
 
+import math
 import numpy as np
 
 from keras.callbacks import Callback, ModelCheckpoint, TensorBoard
@@ -9,13 +10,14 @@ from keras.models import load_model, Sequential
 from keras.optimizers import Adam
 
 from logger import get_logger
-from utils import (batch_generator, encode_text, generate_seed, ID2CHAR, main,
-                   make_dirs, sample_from_probs, VOCAB_SIZE)
+from utils import (batch_generator, encode_text, generate_seed, 
+                   get_CHAR2ID, get_ID2CHAR, get_VOCAB_SIZE, 
+                   main, make_dirs, sample_from_probs, load_text)
 
 logger = get_logger(__name__)
 
 
-def build_model(batch_size, seq_len, vocab_size=VOCAB_SIZE, embedding_size=32,
+def build_model(batch_size, seq_len, vocab_size, embedding_size=32,
                 rnn_size=128, num_layers=2, drop_rate=0.0,
                 learning_rate=0.001, clip_norm=5.0):
     """
@@ -41,6 +43,7 @@ def build_model(batch_size, seq_len, vocab_size=VOCAB_SIZE, embedding_size=32,
     # output shape: (batch_size, seq_len, vocab_size)
     optimizer = Adam(learning_rate, clipnorm=clip_norm)
     model.compile(loss="categorical_crossentropy", optimizer=optimizer)
+    logger.info(model.summary())
     return model
 
 
@@ -58,7 +61,7 @@ def build_inference_model(model, batch_size=1, seq_len=1):
     return inference_model
 
 
-def generate_text(model, seed, length=512, top_n=10):
+def generate_text(model, seed, length=512, top_n=None):
     """
     generates text of specified length from trained model
     with given seed character sequence.
@@ -66,7 +69,7 @@ def generate_text(model, seed, length=512, top_n=10):
     logger.info("generating %s characters from top %s choices.", length, top_n)
     logger.info('generating with seed: "%s".', seed)
     generated = seed
-    encoded = encode_text(seed)
+    encoded = encode_text(seed, get_CHAR2ID())
     model.reset_states()
 
     for idx in encoded[:-1]:
@@ -83,7 +86,7 @@ def generate_text(model, seed, length=512, top_n=10):
         # output shape: (1, 1, vocab_size)
         next_index = sample_from_probs(probs.squeeze(), top_n)
         # append to sequence
-        generated += ID2CHAR[next_index]
+        generated += get_ID2CHAR()[next_index]
 
     logger.info("generated text: \n%s\n", generated)
     return generated
@@ -94,12 +97,17 @@ class LoggerCallback(Callback):
     callback to log information.
     generates text at the end of each epoch.
     """
-    def __init__(self, text, model):
+    best_val = math.inf
+    
+    def __init__(self, text, test_text, model, checkpoint_path):
         super(LoggerCallback, self).__init__()
         self.text = text
+        self.test_text = test_text
         # build inference model using config from learning model
         self.inference_model = build_inference_model(model)
-        self.time_train = self.time_epoch = time.time()
+        self.test_model = build_inference_model(model)
+        self.time_train = self.time_epoch = time.time()                
+        self.checkpoint_path = checkpoint_path
 
     def on_epoch_begin(self, epoch, logs=None):
         self.time_epoch = time.time()
@@ -108,12 +116,29 @@ class LoggerCallback(Callback):
         duration_epoch = time.time() - self.time_epoch
         logger.info("epoch: %s, duration: %ds, loss: %.6g.",
                     epoch, duration_epoch, logs["loss"])
+        
         # transfer weights from learning model
         self.inference_model.set_weights(self.model.get_weights())
 
         # generate text
         seed = generate_seed(self.text)
-        generate_text(self.inference_model, seed)
+        generate_text(self.inference_model, seed, top_n=10)
+        
+        # do validation
+        test_time = time.time()
+        self.test_model.set_weights(self.model.get_weights())
+        
+        if self.test_text and epoch % 10 == 0:
+            bpc = calculate_bpc(self.test_model, self.test_text)
+            logger.info("bpc = %f" % bpc)
+            logger.info("best bpc = %f" % LoggerCallback.best_val)
+            
+            if bpc < LoggerCallback.best_val:
+                LoggerCallback.best_val = bpc
+                self.model.save(self.checkpoint_path.replace('.ckpt', '_bestval.ckpt'))
+            
+            test_duration = time.time() - test_time
+            logger.info("test duration: %ds" % test_duration)
 
     def on_train_begin(self, logs=None):
         logger.info("start of training.")
@@ -136,9 +161,12 @@ def train_main(args):
     main method for train subcommand.
     """
     # load text
-    with open(args.text_path) as f:
-        text = f.read()
-    logger.info("corpus length: %s.", len(text))
+    text = load_text(args.text_path)
+    
+    if args.test_path:
+        test_text = load_text(args.test_path)
+    else:
+        test_text = None
 
     # load or build model
     if args.restore:
@@ -148,7 +176,7 @@ def train_main(args):
     else:
         model = build_model(batch_size=args.batch_size,
                             seq_len=args.seq_len,
-                            vocab_size=VOCAB_SIZE,
+                            vocab_size=get_VOCAB_SIZE(),
                             embedding_size=args.embedding_size,
                             rnn_size=args.rnn_size,
                             num_layers=args.num_layers,
@@ -165,15 +193,25 @@ def train_main(args):
         ModelCheckpoint(args.checkpoint_path, verbose=1, save_best_only=False),
         TensorBoard(log_dir, write_graph=True, embeddings_freq=1,
                     embeddings_metadata={"embedding_1": os.path.abspath(os.path.join("data", "id2char.tsv"))}),
-        LoggerCallback(text, model)
+        LoggerCallback(text, test_text, model, args.checkpoint_path)
     ]
 
     # training start
     num_batches = (len(text) - 1) // (args.batch_size * args.seq_len)
     model.reset_states()
-    model.fit_generator(batch_generator(encode_text(text), args.batch_size, args.seq_len, one_hot_labels=True),
+    model.fit_generator(batch_generator(encode_text(text, get_CHAR2ID()), args.batch_size, args.seq_len, one_hot_labels=True),
                         num_batches, args.num_epochs, callbacks=callbacks)
     return model
+
+
+def retrieve_model(args):
+    # load learning model for config and weights
+    model = load_model(args.checkpoint_path)
+    # build inference model and transfer weights
+    inference_model = build_inference_model(model)
+    inference_model.set_weights(model.get_weights())
+    logger.info("model loaded: %s.", args.checkpoint_path)
+    return inference_model
 
 
 def generate_main(args):
@@ -181,13 +219,8 @@ def generate_main(args):
     generates text from trained model specified in args.
     main method for generate subcommand.
     """
-    # load learning model for config and weights
-    model = load_model(args.checkpoint_path)
-    # build inference model and transfer weights
-    inference_model = build_inference_model(model)
-    inference_model.set_weights(model.get_weights())
-    logger.info("model loaded: %s.", args.checkpoint_path)
-
+    inference_model = retrieve_model(args)
+    
     # create seed if not specified
     if args.seed is None:
         with open(args.text_path) as f:
@@ -200,5 +233,30 @@ def generate_main(args):
     return generate_text(inference_model, seed, args.length, args.top_n)
 
 
+def calculate_bpc(model, test_text):
+    log_sum = 0
+
+    for i, c in enumerate(test_text[:-1]):
+        if i % 100000 == 0:
+            logger.info("process %dth char" % i)
+            
+        x = np.array([[get_CHAR2ID().get(c, 0)]])
+        x_next = get_CHAR2ID().get(test_text[i+1], 0)
+        
+        probs = model.predict(x)        
+        log_sum -= math.log(probs.squeeze()[x_next], 2)        
+        
+    return log_sum / (len(test_text)-1)
+    
+    
+def test_main(args):
+    test_text = load_text(args.test_path)
+    model = retrieve_model(args)
+    model.reset_states()
+        
+    bpc = calculate_bpc(model, test_text)
+    print(bpc)
+
+    
 if __name__ == "__main__":
-    main("Keras", train_main, generate_main)
+    main("Keras", train_main, generate_main, test_main)
